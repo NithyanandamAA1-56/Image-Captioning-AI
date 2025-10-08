@@ -1,1 +1,1 @@
-# Image-Captioning-AI
+Encoder-Decoder model architecture using TensorFlow/Keras, which is the core of the AI. This script includes placeholder functions for data loading, preprocessing, and training, making the entire structure visible in one place.# Image-Captioning-AI
