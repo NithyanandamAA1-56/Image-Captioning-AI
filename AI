@@ -1,0 +1,245 @@
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Embedding, LSTM, Dense, Dropout, Flatten, RepeatVector, TimeDistributed, add
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.preprocessing.text import Tokenizer
+import numpy as np
+import os
+import random
+
+# --- CONFIGURATION CONSTANTS ---
+VOCAB_SIZE = 5000       # Size of the vocabulary (determined by data)
+MAX_CAPTION_LENGTH = 35 # Maximum length of a caption (determined by data)
+EMBEDDING_DIM = 256     # Dimension of the word embeddings
+IMAGE_FEATURE_LEN = 2048 # Output size of the ResNet feature vector (after flattening)
+IMAGE_INPUT_SHAPE = (224, 224, 3) # ResNet input size
+
+# --- 1. DATA AND PREPROCESSING (MOCK FUNCTIONS) ---
+
+def load_and_preprocess_data():
+    """
+    MOCK FUNCTION: In a real project, this function would load the MS COCO dataset 
+    or Flickr8k dataset, tokenize the captions, and preprocess images.
+    """
+    print("--- 1. Data Loading and Preprocessing (MOCK) ---")
+    print("Loading pre-extracted features and tokenizing captions...")
+
+    # Mock Data: Create synthetic features and tokenized sequences
+    
+    # 1. Image Features (Encoder Output)
+    # 100 images, each with a 2048-dimensional feature vector
+    mock_image_features = np.random.rand(100, IMAGE_FEATURE_LEN).astype('float32')
+    
+    # 2. Captions (Decoder Input/Output)
+    # Simple mock captions for tokenization
+    mock_captions = [
+        "startseq a dog is running in the grass endseq",
+        "startseq a cat is sleeping on the couch endseq",
+        "startseq a big red car is driving fast endseq",
+        "startseq a bird is flying in the sky endseq",
+        "startseq a dog is playing fetch endseq"
+    ] * 20
+    
+    # Tokenizer Setup
+    tokenizer = Tokenizer(num_words=VOCAB_SIZE, oov_token="<unk>")
+    tokenizer.fit_on_texts(mock_captions)
+    
+    # Update VOCAB_SIZE based on the actual fitted tokenizer
+    global VOCAB_SIZE
+    VOCAB_SIZE = len(tokenizer.word_index) + 1 # +1 for 0 index padding
+    
+    # Convert captions to sequences
+    sequences = tokenizer.texts_to_sequences(mock_captions)
+    
+    print(f"Total Vocabulary Size: {VOCAB_SIZE}")
+    print(f"Max Sequence Length (set to): {MAX_CAPTION_LENGTH}")
+    
+    return mock_image_features, sequences, tokenizer
+
+def create_training_batches(image_features, sequences, tokenizer):
+    """
+    Generates input-output pairs for training the sequence model.
+    For an LSTM, we train on (Image Features, Partial Caption) -> Next Word.
+    """
+    print("Creating training sequences (X1, X2, Y)...")
+    
+    # X1: Image features (constant for each sequence derived from that image)
+    # X2: Partial input sequence (shifted one word to the right)
+    # Y: Target word (one-hot encoded)
+    
+    X1, X2, Y = [], [], []
+    
+    # Mock loop: Iterate over the 100 image features and their 5 associated captions
+    for i in range(len(image_features)):
+        image_feature = image_features[i]
+        
+        # Get the 5 captions associated with this mock image (simple repeating pattern)
+        for seq in sequences[i*5 : (i+1)*5]:
+            
+            # Create sub-sequences (X2) and target words (Y)
+            for j in range(1, len(seq)):
+                in_seq = seq[:j]
+                out_seq = seq[j]
+                
+                # Pad the input sequence to the MAX_CAPTION_LENGTH
+                in_seq = tf.keras.preprocessing.sequence.pad_sequences([in_seq], maxlen=MAX_CAPTION_LENGTH)[0]
+                
+                # One-hot encode the target word
+                out_seq = to_categorical([out_seq], num_classes=VOCAB_SIZE)[0]
+                
+                X1.append(image_feature)
+                X2.append(in_seq)
+                Y.append(out_seq)
+
+    # Convert lists to NumPy arrays
+    X1 = np.array(X1)
+    X2 = np.array(X2)
+    Y = np.array(Y)
+    
+    print(f"Total training samples created: {X1.shape[0]}")
+    return X1, X2, Y
+
+# --- 2. ENCODER AND DECODER ARCHITECTURE ---
+
+def create_model(vocab_size, max_caption_length, embedding_dim, image_feature_len):
+    """
+    Defines the combined Encoder-Decoder (CNN-RNN) model.
+    """
+    print("--- 2. Building Encoder-Decoder Model ---")
+    
+    # ENCODER (Image Input)
+    # Assumes features are already pre-extracted from a frozen ResNet50
+    image_input = Input(shape=(image_feature_len,), name='Image_Input')
+    
+    # Pass image features through a Dense layer to match the embedding dimension
+    image_features = Dense(embedding_dim, activation='relu', name='Image_Dense')(image_input)
+    
+    # Repeat the image feature vector across the time dimension for the LSTM
+    # This acts as the constant context input at every time step
+    image_features = RepeatVector(max_caption_length, name='Repeat_Context')(image_features)
+
+    # DECODER (Text Input)
+    caption_input = Input(shape=(max_caption_length,), name='Caption_Input')
+    
+    # Word Embedding Layer
+    caption_embedding = Embedding(input_dim=vocab_size, 
+                                  output_dim=embedding_dim, 
+                                  mask_zero=True, 
+                                  name='Word_Embedding')(caption_input)
+    caption_embedding = Dropout(0.5)(caption_embedding)
+    
+    # COMBINE (Merge Image Context and Word Embeddings)
+    # Add them element-wise
+    merged = add([image_features, caption_embedding], name='Merge_Features')
+    
+    # RNN (LSTM) Layer
+    lstm_output = LSTM(512, return_sequences=True, name='LSTM_Decoder')(merged)
+    lstm_output = Dropout(0.5)(lstm_output)
+    
+    # OUTPUT (TimeDistributed Dense Layer for Next Word Prediction)
+    # TimeDistributed ensures the Dense layer is applied to every time step (word)
+    output = TimeDistributed(Dense(vocab_size, activation='softmax'), name='TimeDistributed_Output')(lstm_output)
+    
+    # Final Model
+    model = Model(inputs=[image_input, caption_input], outputs=output)
+    
+    # Compile the model
+    model.compile(loss='categorical_crossentropy', optimizer='adam')
+    
+    print("Model Summary:")
+    model.summary()
+    return model
+
+# --- 3. INFERENCE/PREDICTION (CAPTION GENERATION) ---
+
+def word_for_id(integer, tokenizer):
+    """Utility function to map an integer to a word."""
+    for word, index in tokenizer.word_index.items():
+        if index == integer:
+            return word
+    return None
+
+def generate_caption(model, tokenizer, image_feature):
+    """
+    Generates a caption for a single image feature using greedy search.
+    :param image_feature: The pre-extracted (2048-dim) feature vector for an image.
+    :return: The generated caption string.
+    """
+    print("\n--- 3. Caption Generation (Greedy Search) ---")
+    
+    # Start the sequence with the 'startseq' token
+    in_text = 'startseq'
+    
+    # Reshape image feature for model input
+    image_feature = np.array([image_feature]) # Batch size of 1
+    
+    for i in range(MAX_CAPTION_LENGTH):
+        # Convert the current text to an integer sequence and pad it
+        sequence = tokenizer.texts_to_sequences([in_text])[0]
+        sequence = tf.keras.preprocessing.sequence.pad_sequences([sequence], maxlen=MAX_CAPTION_LENGTH)[0]
+        sequence = np.array([sequence]) # Batch size of 1
+        
+        # Predict the next word probabilities
+        # We only care about the prediction at the *last* time step
+        yhat = model.predict([image_feature, sequence], verbose=0)
+        
+        # Get the index of the word with the highest probability (Greedy Search)
+        yhat = np.argmax(yhat[0, i, :]) 
+        
+        # Map the index to a word
+        word = word_for_id(yhat, tokenizer)
+        
+        # Stop if the word cannot be mapped
+        if word is None:
+            break
+            
+        # Append to the input sequence and check for the end token
+        in_text += ' ' + word
+        if word == 'endseq':
+            break
+            
+    # Clean up the output string
+    final_caption = in_text.replace('startseq', '').replace('endseq', '').strip()
+    return final_caption
+
+# --- MAIN EXECUTION ---
+if __name__ == '__main__':
+    # 1. Load and Preprocess Data (MOCK)
+    image_features, sequences, tokenizer = load_and_preprocess_data()
+    X1_img, X2_cap, Y_word = create_training_batches(image_features, sequences, tokenizer)
+    
+    # 2. Build the Model
+    caption_model = create_model(VOCAB_SIZE, MAX_CAPTION_LENGTH, EMBEDDING_DIM, IMAGE_FEATURE_LEN)
+    
+    # --- TRAINING (MOCK) ---
+    print("\n--- 4. Model Training (MOCK) ---")
+    # In a real scenario, you would train the model for many epochs.
+    # Running a single epoch with mock data to show the process.
+    
+    # Note: Model is trained on the full set of (Image Feature, Partial Sequence) -> Next Word pairs.
+    try:
+        caption_model.fit(
+            [X1_img, X2_cap], 
+            Y_word, 
+            epochs=1, 
+            verbose=1,
+            batch_size=32,
+            # validation_data=... (Ideally, use validation data)
+        )
+        print("\nMOCK Training Complete (1 Epoch).")
+    except Exception as e:
+        print(f"MOCK Training failed (likely due to insufficient mock data): {e}")
+
+    # --- INFERENCE/PREDICTION ---
+    # Take a random mock image feature to test the caption generation
+    test_idx = random.randint(0, len(image_features) - 1)
+    test_feature = image_features[test_idx]
+    
+    predicted_caption = generate_caption(caption_model, tokenizer, test_feature)
+    
+    print("\n--- TEST RESULT ---")
+    print(f"Test Image Feature Index: {test_idx}")
+    # Note: Because the model is trained only for 1 epoch on random data, 
+    # the predicted caption will be nonsensical, but it demonstrates the function flow.
+    print(f"Predicted Caption: {predicted_caption}")
